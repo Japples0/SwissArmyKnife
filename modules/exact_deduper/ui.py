@@ -11,7 +11,7 @@ from pathlib import Path
 from tkinter import ttk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
-from modules.exact_deduper.scanner import scan_for_exact_duplicates
+from modules.exact_deduper.scanner import scan_for_duplicates
 
 
 def get_module(parent, app):
@@ -75,6 +75,31 @@ class ExactDeduperFrame(ttk.Frame):
             command=self._choose_folder
         )
         browse_btn.pack(side="left")
+
+        ttk.Label(controls, text="Mode:").pack(side="left", padx=(10, 4))
+        self.scan_mode_var = tk.StringVar(value="exact")
+        self.scan_mode_combo = ttk.Combobox(
+            controls,
+            state="readonly",
+            textvariable=self.scan_mode_var,
+            values=["exact", "relative"],
+            width=10,
+        )
+        self.scan_mode_combo.pack(side="left")
+        self.scan_mode_combo.bind("<<ComboboxSelected>>", self._on_scan_mode_changed)
+
+        ttk.Label(controls, text="Min Relative %:").pack(side="left", padx=(10, 4))
+        self.relative_threshold_var = tk.DoubleVar(value=85.0)
+        self.relative_threshold_spin = ttk.Spinbox(
+            controls,
+            from_=50,
+            to=100,
+            increment=1,
+            width=5,
+            textvariable=self.relative_threshold_var,
+        )
+        self.relative_threshold_spin.pack(side="left")
+        self.relative_threshold_var.trace_add("write", self._on_relative_threshold_change)
 
         self.start_btn = ttk.Button(
             controls,
@@ -225,6 +250,8 @@ class ExactDeduperFrame(ttk.Frame):
         self.file_list.pack(fill="both", expand=True)
         self.file_list.bind("<<ListboxSelect>>", self._on_file_select)
 
+        self._on_scan_mode_changed()
+
     # ===== Expert Mode UI (hidden unless Expert Mode is enabled in main app) =====
     def _build_expert_ui(self):
         # Build but do not pack; notify_mode_change will toggle visibility
@@ -325,6 +352,8 @@ class ExactDeduperFrame(ttk.Frame):
             "selected_path": self._normalize_path_value(self.selected_path),
             "suspect_path": self._normalize_path_value(self.suspect_path),
             "sort_choice": self.sort_var.get() if hasattr(self, "sort_var") else "Largest->Smallest",
+            "scan_mode": self._selected_scan_mode() if hasattr(self, "scan_mode_var") else "exact",
+            "min_relative_match_pct": self._safe_relative_threshold(),
             "subfolder_depth": max(1, depth),
             "include_dirs": include_paths,
             "ignore_dirs": ignore_paths,
@@ -428,12 +457,18 @@ class ExactDeduperFrame(ttk.Frame):
             saved_depth = int(self._loaded_state.get("subfolder_depth", 1) or 1)
         except Exception:
             saved_depth = 1
+        try:
+            saved_relative = float(self._loaded_state.get("min_relative_match_pct", 85.0) or 85.0)
+        except Exception:
+            saved_relative = 85.0
 
         has_snapshot = any([
             bool((self._loaded_state.get("selected_path") or "").strip()),
             bool((self._loaded_state.get("suspect_path") or "").strip()),
             bool(self._loaded_state.get("include_dirs")),
             bool(self._loaded_state.get("ignore_dirs")),
+            (self._loaded_state.get("scan_mode") or "exact") != "exact",
+            saved_relative != 85.0,
             saved_depth != 1,
             (self._loaded_state.get("sort_choice") or "Largest->Smallest") != "Largest->Smallest",
         ])
@@ -482,6 +517,16 @@ class ExactDeduperFrame(ttk.Frame):
             sort_values = tuple(self.sort_combo.cget("values"))
             self.sort_var.set(saved_sort if saved_sort in sort_values else "Largest->Smallest")
 
+            saved_mode = str(state.get("scan_mode") or "exact").strip().lower()
+            self.scan_mode_var.set("relative" if saved_mode == "relative" else "exact")
+
+            try:
+                saved_threshold = float(state.get("min_relative_match_pct", 85.0) or 85.0)
+            except Exception:
+                saved_threshold = 85.0
+            self.relative_threshold_var.set(max(50.0, min(100.0, saved_threshold)))
+            self._on_scan_mode_changed()
+
             include_dirs = state.get("include_dirs") or []
             ignore_dirs = state.get("ignore_dirs") or []
             self._restore_filter_labels_from_paths(include_dirs, ignore_dirs)
@@ -511,8 +556,35 @@ class ExactDeduperFrame(ttk.Frame):
         self._populate_groups()
         self._save_state()
 
+    def _on_scan_mode_changed(self, _event=None):
+        mode = self._selected_scan_mode()
+        if mode == "relative":
+            self.start_btn.config(text="Run Relative Deduper")
+            self.relative_threshold_spin.config(state="normal")
+        else:
+            self.start_btn.config(text="Run Exact Deduper")
+            self.relative_threshold_spin.config(state="disabled")
+        self._save_state()
+
+    def _on_relative_threshold_change(self, *_args):
+        self._save_state()
+
     def _on_subfolder_depth_change(self, *_args):
         self._save_state()
+
+    def _selected_scan_mode(self) -> str:
+        try:
+            mode = str(self.scan_mode_var.get() or "exact").strip().lower()
+        except Exception:
+            mode = "exact"
+        return "relative" if mode == "relative" else "exact"
+
+    def _safe_relative_threshold(self) -> float:
+        try:
+            value = float(self.relative_threshold_var.get())
+        except Exception:
+            value = 85.0
+        return max(50.0, min(100.0, value))
 
     # -------- Expert helpers --------
     def _refresh_expert_lists(self, include_items: list[str], ignore_items: list[str], save_state: bool = True):
@@ -645,7 +717,10 @@ class ExactDeduperFrame(ttk.Frame):
 
         # Precompute totals for size sorts
         def total_size(g: dict) -> int:
-            return int(g.get("size", 0)) * max(1, len(g.get("files", [])))
+            try:
+                return sum(int(getattr(entry, "size", 0) or 0) for entry in g.get("files", []))
+            except Exception:
+                return int(g.get("size", 0)) * max(1, len(g.get("files", [])))
 
         # Key based on choice
         if choice == "Largest->Smallest":
@@ -734,7 +809,8 @@ class ExactDeduperFrame(ttk.Frame):
 
     def _handle_event(self, event, data):
         if event == "scan_start":
-            self.log(f"Scanning: {data['root']}")
+            mode = str(data.get("mode") or "exact").lower()
+            self.log(f"Scanning ({mode}): {data['root']}")
 
         elif event == "file_discovered":
             self.log(f"Files found: {data['count']}")
@@ -746,12 +822,20 @@ class ExactDeduperFrame(ttk.Frame):
         elif event == "hash_progress":
             self.progress["value"] = data["current"]
 
+        elif event == "compare_start":
+            self.progress["maximum"] = data["total"]
+            self.progress["value"] = 0
+
+        elif event == "compare_progress":
+            self.progress["value"] = data["current"]
+
         elif event == "scan_complete":
             self._populate_groups()
             self.progress["value"] = 0
 
+            mode = str(data.get("mode") or "exact").lower()
             self.log(
-                f"Scan complete - {data['groups']} duplicate groups "
+                f"{mode.title()} scan complete - {data['groups']} duplicate groups "
                 f"({data['files_scanned']} files scanned)"
             )
 
@@ -802,8 +886,14 @@ class ExactDeduperFrame(ttk.Frame):
             self._update_start_button_state()
             return
 
+        selected_mode = self._selected_scan_mode()
+        relative_threshold = self._safe_relative_threshold()
+
         self.scanning = True
-        self.log("Starting exact dedupe scan...")
+        if selected_mode == "relative":
+            self.log(f"Starting relative dedupe scan (minimum relative match: {relative_threshold:.1f}%)...")
+        else:
+            self.log("Starting exact dedupe scan...")
         self.cancel_requested = False
         self._update_start_button_state()
         self.cancel_btn.config(state="normal")
@@ -814,12 +904,14 @@ class ExactDeduperFrame(ttk.Frame):
         def worker():
             try:
                 include_dirs, ignore_dirs = self._get_expert_filters()
-                self.results = scan_for_exact_duplicates(
+                self.results = scan_for_duplicates(
                     self.selected_path,
+                    mode=selected_mode,
                     progress_callback=self._scanner_callback,
                     cancel_check=lambda: self.cancel_requested,
                     include_dirs=include_dirs,
-                    ignore_dirs=ignore_dirs
+                    ignore_dirs=ignore_dirs,
+                    min_relative_match_pct=relative_threshold,
                 )
             finally:
                 self.event_queue.put(("thread_done", {}))
@@ -846,7 +938,8 @@ class ExactDeduperFrame(ttk.Frame):
 
         # Enable the delete button only if there are duplicates to delete
         if hasattr(self, "delete_btn"):
-            self.delete_btn.config(state="normal" if len(group["files"]) > 1 else "disabled")
+            is_exact = str(group.get("mode") or "exact").lower() == "exact"
+            self.delete_btn.config(state="normal" if is_exact and len(group["files"]) > 1 else "disabled")
 
         # Auto-select the first file to ensure a preview is shown (helps video groups)
         if self.file_list.size() > 0:
@@ -884,7 +977,7 @@ class ExactDeduperFrame(ttk.Frame):
 
         for i, group in enumerate(self.results):
             file_count = len(group["files"])
-            size_bytes = group["size"] * file_count
+            size_bytes = sum(int(getattr(entry, "size", 0) or 0) for entry in group["files"])
 
             # Human-readable size
             if size_bytes >= 1024 ** 3:
@@ -895,10 +988,19 @@ class ExactDeduperFrame(ttk.Frame):
                 size_str = f"{size_bytes / 1024:.1f} KB"
 
             label = f"Group {i + 1} - {file_count} files - {size_str}"
+            if str(group.get("mode") or "exact").lower() == "relative":
+                try:
+                    rel_pct = float(group.get("relative_match_pct", 0.0))
+                except Exception:
+                    rel_pct = 0.0
+                label += f" - Relative match {rel_pct:.1f}%"
             self.group_list.insert("end", label)
 
         # Enable/disable the global delete button depending on whether duplicates exist
-        has_dupes = any(len(g.get("files", [])) > 1 for g in self.results)
+        has_dupes = any(
+            len(g.get("files", [])) > 1 and str(g.get("mode") or "exact").lower() == "exact"
+            for g in self.results
+        )
         if hasattr(self, "delete_all_btn"):
             self.delete_all_btn.config(state="normal" if has_dupes else "disabled")
 
@@ -926,6 +1028,9 @@ class ExactDeduperFrame(ttk.Frame):
 
         index = selection[0]
         group = self.results[index]
+        if str(group.get("mode") or "exact").lower() != "exact":
+            self.log("Relative match groups are preview-only in this first implementation. Run Exact mode to enable deletion.")
+            return
         files = group["files"]
 
         if len(files) <= 1:
@@ -999,9 +1104,12 @@ class ExactDeduperFrame(ttk.Frame):
             self.log("No results to process.")
             return
 
-        groups = [g for g in self.results if len(g.get("files", [])) > 1]
+        groups = [
+            g for g in self.results
+            if len(g.get("files", [])) > 1 and str(g.get("mode") or "exact").lower() == "exact"
+        ]
         if not groups:
-            self.log("No duplicate groups to delete.")
+            self.log("No exact duplicate groups to delete.")
             return
 
         # Plan deletions: choose the cleanest name per group to keep
