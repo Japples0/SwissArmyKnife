@@ -305,11 +305,14 @@ def scan_for_relative_duplicates(
         return []
     files, file_count = discovered
 
-    for entry in files:
+    _emit(progress_callback, "metadata_start", total=file_count)
+    for idx, entry in enumerate(files, start=1):
         if _should_cancel(cancel_check):
             _emit(progress_callback, "scan_cancelled")
             return []
         entry.duration_seconds = _probe_video_duration_seconds(entry.path)
+        if idx % 25 == 0 or idx == file_count:
+            _emit(progress_callback, "metadata_progress", current=idx, total=file_count)
 
     n = len(files)
     if n < 2:
@@ -327,6 +330,7 @@ def scan_for_relative_duplicates(
     accepted_pairs: dict[tuple[int, int], float] = {}
 
     pair_idx = 0
+    progress_step = max(1, total_pairs // 300)
     for i in range(n - 1):
         file_a = files[i]
         name_a = _normalize_name_for_matching(file_a.path)
@@ -339,7 +343,7 @@ def scan_for_relative_duplicates(
             file_b = files[j]
             pair_idx += 1
 
-            if pair_idx % 250 == 0 or pair_idx == total_pairs:
+            if pair_idx % progress_step == 0 or pair_idx == total_pairs:
                 _emit(progress_callback, "compare_progress", current=pair_idx, total=total_pairs)
 
             # First pass gate to keep first implementation reasonably fast.

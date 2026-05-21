@@ -276,12 +276,14 @@ class ExactDeduperFrame(ttk.Frame):
         ttk.Button(ctrl_row, text="Load Subfolders", command=self._load_subfolders).pack(side="right")
         self.subfolder_depth_var.trace_add("write", self._on_subfolder_depth_change)
 
-        # Two-column include/ignore lists with move buttons
+        # Three-column include/ignore/protected lists with move buttons
         lists = ttk.Frame(container)
         lists.pack(fill="x")
         lists.columnconfigure(0, weight=1)
         lists.columnconfigure(1, weight=0)
         lists.columnconfigure(2, weight=1)
+        lists.columnconfigure(3, weight=0)
+        lists.columnconfigure(4, weight=1)
 
         # Include list
         left_col = ttk.Frame(lists)
@@ -297,11 +299,24 @@ class ExactDeduperFrame(ttk.Frame):
         ttk.Button(mid_col, text="<< Include", command=self._move_to_include).pack(pady=4)
 
         # Ignore list
-        right_col = ttk.Frame(lists)
-        right_col.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
-        ttk.Label(right_col, text="Ignore Folders").pack(anchor="w")
-        self.ignore_listbox = tk.Listbox(right_col, height=6, exportselection=False)
+        center_col = ttk.Frame(lists)
+        center_col.grid(row=0, column=2, sticky="nsew", padx=(6, 6))
+        ttk.Label(center_col, text="Ignore Folders").pack(anchor="w")
+        self.ignore_listbox = tk.Listbox(center_col, height=6, exportselection=False)
         self.ignore_listbox.pack(fill="both", expand=True)
+
+        # Move buttons: ignore <-> protected
+        right_mid_col = ttk.Frame(lists)
+        right_mid_col.grid(row=0, column=3, sticky="ns")
+        ttk.Button(right_mid_col, text=">> Protect", command=self._move_ignore_to_protected).pack(pady=4)
+        ttk.Button(right_mid_col, text="<< Ignore", command=self._move_protected_to_ignore).pack(pady=4)
+
+        # Protected list
+        right_col = ttk.Frame(lists)
+        right_col.grid(row=0, column=4, sticky="nsew", padx=(6, 0))
+        ttk.Label(right_col, text="Protected Folders (Never Delete)").pack(anchor="w")
+        self.protected_listbox = tk.Listbox(right_col, height=6, exportselection=False)
+        self.protected_listbox.pack(fill="both", expand=True)
 
     def notify_mode_change(self):
         """Called by main app when a mode is toggled; show/hide Expert panel."""
@@ -343,7 +358,7 @@ class ExactDeduperFrame(ttk.Frame):
         if self._suspend_state_save:
             return
 
-        include_paths, ignore_paths = self._capture_filter_paths()
+        include_paths, ignore_paths, protected_paths = self._capture_filter_paths()
         try:
             depth = int(self.subfolder_depth_var.get()) if hasattr(self, "subfolder_depth_var") else 1
         except Exception:
@@ -357,6 +372,7 @@ class ExactDeduperFrame(ttk.Frame):
             "subfolder_depth": max(1, depth),
             "include_dirs": include_paths,
             "ignore_dirs": ignore_paths,
+            "protected_dirs": protected_paths,
         }
 
         try:
@@ -380,14 +396,17 @@ class ExactDeduperFrame(ttk.Frame):
             return normalized
         return None
 
-    def _capture_filter_paths(self) -> tuple[list[str], list[str]]:
+    def _capture_filter_paths(self) -> tuple[list[str], list[str], list[str]]:
         include_labels = list(self.include_listbox.get(0, "end")) if hasattr(self, "include_listbox") else []
         ignore_labels = list(self.ignore_listbox.get(0, "end")) if hasattr(self, "ignore_listbox") else []
+        protected_labels = list(self.protected_listbox.get(0, "end")) if hasattr(self, "protected_listbox") else []
 
         include_paths = []
         ignore_paths = []
+        protected_paths = []
         seen_include = set()
         seen_ignore = set()
+        seen_protected = set()
 
         for label in include_labels:
             resolved = self._resolve_folder_label_to_path(label)
@@ -401,7 +420,13 @@ class ExactDeduperFrame(ttk.Frame):
                 seen_ignore.add(resolved)
                 ignore_paths.append(resolved)
 
-        return include_paths, ignore_paths
+        for label in protected_labels:
+            resolved = self._resolve_folder_label_to_path(label)
+            if resolved and resolved not in seen_protected:
+                seen_protected.add(resolved)
+                protected_paths.append(resolved)
+
+        return include_paths, ignore_paths, protected_paths
 
     def _build_folder_label(self, folder_path: str) -> str:
         abs_path = os.path.abspath(folder_path)
@@ -417,12 +442,14 @@ class ExactDeduperFrame(ttk.Frame):
                 pass
         return abs_path
 
-    def _restore_filter_labels_from_paths(self, include_dirs: list[str], ignore_dirs: list[str]):
+    def _restore_filter_labels_from_paths(self, include_dirs: list[str], ignore_dirs: list[str], protected_dirs: list[str]):
         include_labels = []
         ignore_labels = []
+        protected_labels = []
         new_map = dict(self._folder_label_to_path)
         seen_include = set()
         seen_ignore = set()
+        seen_protected = set()
 
         for folder in include_dirs or []:
             normalized = self._normalize_existing_dir(folder)
@@ -442,12 +469,25 @@ class ExactDeduperFrame(ttk.Frame):
             ignore_labels.append(label)
             new_map[label] = normalized
 
+        for folder in protected_dirs or []:
+            normalized = self._normalize_existing_dir(folder)
+            if not normalized or normalized in seen_protected:
+                continue
+            seen_protected.add(normalized)
+            label = self._build_folder_label(normalized)
+            protected_labels.append(label)
+            new_map[label] = normalized
+
         if ignore_labels:
             ignore_set = set(ignore_labels)
             include_labels = [label for label in include_labels if label not in ignore_set]
+        if protected_labels:
+            protected_set = set(protected_labels)
+            include_labels = [label for label in include_labels if label not in protected_set]
+            ignore_labels = [label for label in ignore_labels if label not in protected_set]
 
         self._folder_label_to_path = new_map
-        self._refresh_expert_lists(include_labels, ignore_labels, save_state=False)
+        self._refresh_expert_lists(include_labels, ignore_labels, protected_labels, save_state=False)
 
     def _show_restore_prompt_on_load(self):
         if not isinstance(self._loaded_state, dict) or not self._loaded_state:
@@ -467,6 +507,7 @@ class ExactDeduperFrame(ttk.Frame):
             bool((self._loaded_state.get("suspect_path") or "").strip()),
             bool(self._loaded_state.get("include_dirs")),
             bool(self._loaded_state.get("ignore_dirs")),
+            bool(self._loaded_state.get("protected_dirs")),
             (self._loaded_state.get("scan_mode") or "exact") != "exact",
             saved_relative != 85.0,
             saved_depth != 1,
@@ -477,12 +518,14 @@ class ExactDeduperFrame(ttk.Frame):
 
         include_count = len(self._loaded_state.get("include_dirs") or [])
         ignore_count = len(self._loaded_state.get("ignore_dirs") or [])
+        protected_count = len(self._loaded_state.get("protected_dirs") or [])
         selected_path = self._loaded_state.get("selected_path") or "(not set)"
         summary = (
             "Restore your previous Exact Deduper setup?\n\n"
             f"Folder: {selected_path}\n"
             f"Expert include folders: {include_count}\n"
             f"Expert ignore folders: {ignore_count}\n\n"
+            f"Protected folders: {protected_count}\n\n"
             "If expert filters are restored, Expert Mode will be turned on automatically."
         )
         restore = messagebox.askyesno(
@@ -529,7 +572,8 @@ class ExactDeduperFrame(ttk.Frame):
 
             include_dirs = state.get("include_dirs") or []
             ignore_dirs = state.get("ignore_dirs") or []
-            self._restore_filter_labels_from_paths(include_dirs, ignore_dirs)
+            protected_dirs = state.get("protected_dirs") or []
+            self._restore_filter_labels_from_paths(include_dirs, ignore_dirs, protected_dirs)
         finally:
             self._suspend_state_save = False
 
@@ -539,8 +583,8 @@ class ExactDeduperFrame(ttk.Frame):
         self._save_state()
 
     def _auto_enable_expert_mode_if_filters_present(self):
-        include_paths, ignore_paths = self._capture_filter_paths()
-        if not include_paths and not ignore_paths:
+        include_paths, ignore_paths, protected_paths = self._capture_filter_paths()
+        if not include_paths and not ignore_paths and not protected_paths:
             return
 
         try:
@@ -548,7 +592,7 @@ class ExactDeduperFrame(ttk.Frame):
             if expert_var and not bool(expert_var.get()):
                 expert_var.set(True)
                 self.notify_mode_change()
-                self.log("Expert Mode enabled automatically to apply restored include/ignore filters.")
+                self.log("Expert Mode enabled automatically to apply restored include/ignore/protected filters.")
         except Exception:
             pass
 
@@ -587,13 +631,16 @@ class ExactDeduperFrame(ttk.Frame):
         return max(50.0, min(100.0, value))
 
     # -------- Expert helpers --------
-    def _refresh_expert_lists(self, include_items: list[str], ignore_items: list[str], save_state: bool = True):
+    def _refresh_expert_lists(self, include_items: list[str], ignore_items: list[str], protected_items: list[str] | None = None, save_state: bool = True):
         self.include_listbox.delete(0, "end")
         self.ignore_listbox.delete(0, "end")
+        self.protected_listbox.delete(0, "end")
         for p in include_items:
             self.include_listbox.insert("end", p)
         for p in ignore_items:
             self.ignore_listbox.insert("end", p)
+        for p in protected_items or []:
+            self.protected_listbox.insert("end", p)
         if save_state:
             self._save_state()
 
@@ -638,10 +685,12 @@ class ExactDeduperFrame(ttk.Frame):
             self.log(f"Failed to enumerate subfolders: {ex}")
             sub_labels = []
 
-        # Load subfolders into include; keep current ignores intact (intersection removed from include)
+        # Load subfolders into include; keep current ignores/protected intact.
         current_ignores = list(self.ignore_listbox.get(0, "end")) if hasattr(self, "ignore_listbox") else []
-        include = [label for label in sub_labels if label not in set(current_ignores)]
-        self._refresh_expert_lists(include, current_ignores)
+        current_protected = list(self.protected_listbox.get(0, "end")) if hasattr(self, "protected_listbox") else []
+        blocked = set(current_ignores) | set(current_protected)
+        include = [label for label in sub_labels if label not in blocked]
+        self._refresh_expert_lists(include, current_ignores, current_protected)
         self.log(f"Loaded {len(sub_labels)} subfolder(s) up to depth {max_depth}.")
 
     def _move_to_ignore(self):
@@ -655,6 +704,7 @@ class ExactDeduperFrame(ttk.Frame):
                 self.include_listbox.delete(idx)
             except Exception:
                 pass
+        self._remove_labels_from_listbox(self.protected_listbox, items)
         for it in items:
             if it not in existing_ign:
                 self.ignore_listbox.insert("end", it)
@@ -662,19 +712,77 @@ class ExactDeduperFrame(ttk.Frame):
 
     def _move_to_include(self):
         sel = list(self.ignore_listbox.curselection())
-        if not sel:
-            return
         items = [self.ignore_listbox.get(i) for i in sel]
-        existing_inc = set(self.include_listbox.get(0, "end"))
+        protected_sel = list(self.protected_listbox.curselection())
+        items.extend(self.protected_listbox.get(i) for i in protected_sel)
+        if not items:
+            return
+
+        # Clear selected rows from source lists first.
         for idx in reversed(sel):
             try:
                 self.ignore_listbox.delete(idx)
             except Exception:
                 pass
+        for idx in reversed(protected_sel):
+            try:
+                self.protected_listbox.delete(idx)
+            except Exception:
+                pass
+
+        existing_inc = set(self.include_listbox.get(0, "end"))
         for it in items:
             if it not in existing_inc:
                 self.include_listbox.insert("end", it)
         self._save_state()
+
+    def _move_ignore_to_protected(self):
+        sel = list(self.ignore_listbox.curselection())
+        if not sel:
+            return
+        items = [self.ignore_listbox.get(i) for i in sel]
+        for idx in reversed(sel):
+            try:
+                self.ignore_listbox.delete(idx)
+            except Exception:
+                pass
+        self._remove_labels_from_listbox(self.include_listbox, items)
+        existing_protected = set(self.protected_listbox.get(0, "end"))
+        for it in items:
+            if it not in existing_protected:
+                self.protected_listbox.insert("end", it)
+        self._save_state()
+
+    def _move_protected_to_ignore(self):
+        sel = list(self.protected_listbox.curselection())
+        if not sel:
+            return
+        items = [self.protected_listbox.get(i) for i in sel]
+        for idx in reversed(sel):
+            try:
+                self.protected_listbox.delete(idx)
+            except Exception:
+                pass
+        self._remove_labels_from_listbox(self.include_listbox, items)
+        existing_ign = set(self.ignore_listbox.get(0, "end"))
+        for it in items:
+            if it not in existing_ign:
+                self.ignore_listbox.insert("end", it)
+        self._save_state()
+
+    def _remove_labels_from_listbox(self, listbox: tk.Listbox, labels: list[str]):
+        if not labels:
+            return
+        existing = list(listbox.get(0, "end"))
+        if not existing:
+            return
+        label_set = set(labels)
+        for idx in reversed(range(len(existing))):
+            if existing[idx] in label_set:
+                try:
+                    listbox.delete(idx)
+                except Exception:
+                    pass
 
     def _get_expert_filters(self) -> tuple[list[str] | None, list[str] | None]:
         """Return (include_dirs, ignore_dirs) according to Expert Mode UI."""
@@ -691,6 +799,17 @@ class ExactDeduperFrame(ttk.Frame):
         except Exception:
             pass
         return (None, None)
+
+    def _get_protected_dirs(self) -> list[str]:
+        """Return protected folder absolute paths when Expert Mode is enabled."""
+        try:
+            if getattr(self.app, "expert_mode_enabled", None) and self.app.expert_mode_enabled.get():
+                protected_items = list(self.protected_listbox.get(0, "end")) if hasattr(self, "protected_listbox") else []
+                protected_items = [self._resolve_folder_label_to_path(lbl) for lbl in protected_items]
+                return [p for p in protected_items if p]
+        except Exception:
+            pass
+        return []
 
     def _resolve_folder_label_to_path(self, label: str) -> str | None:
         mapped = self._folder_label_to_path.get(label)
@@ -822,12 +941,19 @@ class ExactDeduperFrame(ttk.Frame):
         elif event == "hash_progress":
             self.progress["value"] = data["current"]
 
+        elif event == "metadata_start":
+            self.progress["maximum"] = max(1, int(data.get("total", 1)))
+            self.progress["value"] = 0
+
+        elif event == "metadata_progress":
+            self.progress["value"] = int(data.get("current", 0))
+
         elif event == "compare_start":
-            self.progress["maximum"] = data["total"]
+            self.progress["maximum"] = max(1, int(data.get("total", 1)))
             self.progress["value"] = 0
 
         elif event == "compare_progress":
-            self.progress["value"] = data["current"]
+            self.progress["value"] = int(data.get("current", 0))
 
         elif event == "scan_complete":
             self._populate_groups()
@@ -1039,20 +1165,31 @@ class ExactDeduperFrame(ttk.Frame):
                 self.delete_btn.config(state="disabled")
             return
 
+        protected_entries = [e for e in files if self._is_in_protected_folder(str(e.path))]
+        unprotected_entries = [e for e in files if e not in protected_entries]
+        if not unprotected_entries:
+            self.log("All files in this group are inside protected folders. Nothing will be deleted.")
+            return
+
         # Determine the keeper based on selection in file_list (if any)
         keeper_idx = None
         file_sel = self.file_list.curselection()
         if file_sel:
             keeper_path = self.file_list.get(file_sel[0])
             for i, entry in enumerate(files):
-                if str(entry.path) == keeper_path:
+                if str(entry.path) == keeper_path and entry in unprotected_entries:
                     keeper_idx = i
                     break
-        if keeper_idx is None:
-            keeper_idx = self._pick_preferred_keeper_index(files, prefer_outside_suspect=True)
-
-        keeper = files[keeper_idx]
-        to_delete = [e for i, e in enumerate(files) if i != keeper_idx]
+        if protected_entries:
+            keeper = protected_entries[0]
+            to_delete = list(unprotected_entries)
+            if file_sel and keeper_idx is None:
+                self.log("Selected keeper is protected-overridden. Files in protected folders are always kept.")
+        else:
+            if keeper_idx is None:
+                keeper_idx = self._pick_preferred_keeper_index(files, prefer_outside_suspect=True)
+            keeper = files[keeper_idx]
+            to_delete = [e for i, e in enumerate(files) if i != keeper_idx]
 
         total_bytes = sum(e.size for e in to_delete)
         pretty_total = self._pretty_size(total_bytes)
@@ -1061,8 +1198,12 @@ class ExactDeduperFrame(ttk.Frame):
             "Confirm Delete",
             "Delete {n} duplicate file(s) in this group and keep:\n\n{keeper}\n\n"
             "Total to remove: {size}\n\n"
+            "{protected}"
             "This will permanently delete files. Continue?".format(
-                n=len(to_delete), keeper=keeper.path, size=pretty_total
+                n=len(to_delete),
+                keeper=keeper.path,
+                size=pretty_total,
+                protected=("Protected folders are enabled; protected files will not be deleted.\n\n" if protected_entries else ""),
             )
         )
         if not confirm:
@@ -1079,8 +1220,9 @@ class ExactDeduperFrame(ttk.Frame):
                 errors += 1
                 self.log(f"Failed to delete {e.path}: {ex}")
 
-        # Update results: keep only the keeper file in this group
-        group["files"] = [keeper]
+        # Update results to reflect policy: protected entries stay, plus keeper if needed.
+        remaining = [e for e in files if os.path.exists(e.path)]
+        group["files"] = remaining
 
         # If the group is no longer a duplicate set, remove it
         if len(group["files"]) <= 1:
@@ -1114,11 +1256,18 @@ class ExactDeduperFrame(ttk.Frame):
 
         # Plan deletions: choose the cleanest name per group to keep
         deletion_plan = []
+        protected_skips = 0
         for g in groups:
             files = g["files"]
             if len(files) > 1:
-                k_idx = self._pick_preferred_keeper_index(files, prefer_outside_suspect=True)
-                deletion_plan.extend([e for i, e in enumerate(files) if i != k_idx])
+                protected_entries = [e for e in files if self._is_in_protected_folder(str(e.path))]
+                if protected_entries:
+                    unprotected_entries = [e for e in files if e not in protected_entries]
+                    protected_skips += len(protected_entries)
+                    deletion_plan.extend(unprotected_entries)
+                else:
+                    k_idx = self._pick_preferred_keeper_index(files, prefer_outside_suspect=True)
+                    deletion_plan.extend([e for i, e in enumerate(files) if i != k_idx])
 
         if not deletion_plan:
             self.log("Nothing to delete - already at one per group.")
@@ -1132,13 +1281,25 @@ class ExactDeduperFrame(ttk.Frame):
                 "Priority mode is active: files inside the suspect folder will be deleted first when possible.\n"
                 f"Suspect folder: {self.suspect_path}\n\n"
             )
+        protected_note = ""
+        protected_dirs = self._get_protected_dirs()
+        if protected_dirs:
+            protected_note = (
+                "Protected folders are active: files inside protected folders are never deleted.\n"
+                f"Protected folders configured: {len(protected_dirs)}\n"
+                f"Protected files skipped in this pass: {protected_skips}\n\n"
+            )
 
         confirm = messagebox.askyesno(
             "Confirm Delete All Duplicates",
-            "{suspect}Delete {n} duplicate file(s) across {g} group(s), keeping one per group.\n\n"
+            "{suspect}{protected}Delete {n} duplicate file(s) across {g} group(s), keeping one per group.\n\n"
             "Total to remove: {size}\n\n"
             "This will permanently delete files. Continue?".format(
-                suspect=suspect_note, n=len(deletion_plan), g=len(groups), size=pretty_total
+                suspect=suspect_note,
+                protected=protected_note,
+                n=len(deletion_plan),
+                g=len(groups),
+                size=pretty_total,
             )
         )
         if not confirm:
@@ -1390,18 +1551,45 @@ class ExactDeduperFrame(ttk.Frame):
         except Exception:
             return False
 
+    def _is_in_any_folder(self, filepath: str, folders: list[str]) -> bool:
+        if not folders:
+            return False
+        try:
+            file_abs = os.path.abspath(filepath)
+            file_abs_norm = os.path.normcase(file_abs)
+            for folder in folders:
+                try:
+                    folder_abs = os.path.abspath(folder)
+                    common = os.path.commonpath([file_abs, folder_abs])
+                    if os.path.normcase(common) == os.path.normcase(folder_abs):
+                        return True
+                except Exception:
+                    folder_abs_norm = os.path.normcase(os.path.abspath(folder))
+                    if file_abs_norm.startswith(folder_abs_norm):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _is_in_protected_folder(self, filepath: str) -> bool:
+        return self._is_in_any_folder(filepath, self._get_protected_dirs())
+
     def _pick_preferred_keeper_index(self, files, prefer_outside_suspect: bool = False) -> int:
         """Return the index of the best keeper file based on configured preference."""
         best_idx = 0
-        best_tuple = (float("inf"), float("inf"), float("inf"), 0)  # (suspect_rank, score, name_len, index)
+        protected_dirs = self._get_protected_dirs()
+        best_tuple = (float("inf"), float("inf"), float("inf"), float("inf"), 0)  # (protected_rank, suspect_rank, score, name_len, index)
         for i, entry in enumerate(files):
             path = str(entry.path)
             base = os.path.splitext(os.path.basename(path))[0]
             s = self._keeper_score(path)
+            protected_rank = 1
+            if protected_dirs and self._is_in_any_folder(path, protected_dirs):
+                protected_rank = 0
             suspect_rank = 0
             if prefer_outside_suspect and self._is_in_suspect_folder(path):
                 suspect_rank = 1
-            tup = (suspect_rank, s, len(base), i)
+            tup = (protected_rank, suspect_rank, s, len(base), i)
             if tup < best_tuple:
                 best_tuple = tup
                 best_idx = i
