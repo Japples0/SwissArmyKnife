@@ -1,3 +1,4 @@
+import json
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -10,6 +11,70 @@ SUPPORTED_EXTS = [
     "webp",
     "heic", "heif"
 ]
+
+
+def collect_image_paths(directory, filetype="combine"):
+    """Return image paths in explicit manifest order or flat natural order."""
+    directory = os.path.abspath(directory)
+    wanted_type = filetype.lower()
+    manifest_path = os.path.join(directory, "manifest.json")
+
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+                manifest = json.load(manifest_file)
+            ordered_paths = []
+            for chapter in manifest.get("chapters", []):
+                for image in chapter.get("images", []):
+                    local_path = image.get("local_path")
+                    if not local_path:
+                        continue
+                    parts = local_path.replace("\\", "/").split("/")
+                    absolute_path = os.path.join(directory, *parts)
+                    extension = os.path.splitext(absolute_path)[1].lower().lstrip(".")
+                    if not os.path.isfile(absolute_path):
+                        continue
+                    if wanted_type != "combine" and extension != wanted_type:
+                        continue
+                    if extension in SUPPORTED_EXTS:
+                        ordered_paths.append(absolute_path)
+            if ordered_paths:
+                return ordered_paths
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(f"Could not read sequential manifest; using flat folder scan: {exc}")
+
+    if wanted_type == "combine":
+        filenames = [
+            filename
+            for filename in os.listdir(directory)
+            if any(filename.lower().endswith(f".{extension}") for extension in SUPPORTED_EXTS)
+        ]
+    else:
+        filenames = [
+            filename
+            for filename in os.listdir(directory)
+            if filename.lower().endswith(f".{wanted_type}")
+        ]
+    return [os.path.join(directory, filename) for filename in natsorted(filenames)]
+
+
+def create_pdf_from_images(image_paths, output_path):
+    """Create a PDF from image paths already arranged in the desired order."""
+    images = []
+    try:
+        for image_path in image_paths:
+            try:
+                with Image.open(image_path) as source:
+                    images.append(source.convert("RGB"))
+            except Exception as exc:
+                print(f"Skipping {image_path}: {exc}")
+        if not images:
+            raise ValueError("Could not load any images.")
+        images[0].save(output_path, save_all=True, append_images=images[1:])
+        return len(images)
+    finally:
+        for image in images:
+            image.close()
 
 # HEIC/HEIF support (if available)
 try:
@@ -203,46 +268,20 @@ class PDFCompiler(ttk.Frame):
             folder = os.path.basename(path)
             self.filename_var.set(f"{folder}.pdf")
 
-        filetype = self.filetype_var.get().lower()
-        combine = (filetype == "combine")
-
-        SUPPORTED_ALL = [
-            "jpg", "jpeg", "png",
-            "webp", "heic", "heif"
-        ]
-
-        if combine:
-            matching_files = natsorted([
-                f for f in os.listdir(path)
-                if any(f.lower().endswith(f".{ext}") for ext in SUPPORTED_ALL)
-            ])
-        else:
-            matching_files = natsorted([
-                f for f in os.listdir(path)
-                if f.lower().endswith(f".{filetype}")
-            ])
-
-        if not matching_files:
+        image_paths = collect_image_paths(path, self.filetype_var.get())
+        if not image_paths:
             messagebox.showerror("No Images", f"No matching images found.")
             return
 
         # Save to same directory
         pdf_path = self.get_output_path()
 
-        images = []
-        for f in matching_files:
-            try:
-                img = Image.open(os.path.join(path, f)).convert("RGB")
-                images.append(img)
-            except Exception as e:
-                print("Skipping", f, e)
-
-        if not images:
-            messagebox.showerror("Error", "Could not load any images.")
+        try:
+            image_count = create_pdf_from_images(image_paths, pdf_path)
+        except Exception as exc:
+            messagebox.showerror("Error", f"Could not create PDF:\n{exc}")
             return
-
-        images[0].save(pdf_path, save_all=True, append_images=images[1:])
-        messagebox.showinfo("Success", f"PDF created:\n{pdf_path}")
+        messagebox.showinfo("Success", f"PDF created from {image_count} image(s):\n{pdf_path}")
 
     def expert_compile(self):
         self.preparation_checks()
@@ -259,25 +298,19 @@ class PDFCompiler(ttk.Frame):
         if not path or not os.path.isdir(path):
             errors.append("⚠️ Invalid or missing image directory.")
 
-        SUPPORTED_ALL = [
-            "jpg", "jpeg", "png",
-            "webp", "heic", "heif"
-        ]
+        matching_paths = collect_image_paths(path, filetype) if path and os.path.isdir(path) else []
 
         if not filetype:
             errors.append("⚠️ File type must be selected.")
         else:
             if filetype == "combine":
                 # Check for ANY supported file
-                has_supported = any(
-                    any(f.lower().endswith("." + ext) for ext in SUPPORTED_ALL)
-                    for f in os.listdir(path)
-                )
+                has_supported = bool(matching_paths)
                 if not has_supported:
                     errors.append("⚠️ No supported image files found for Combine mode.")
             else:
                 # Normal single-type validation
-                has_type = any(f.lower().endswith(f".{filetype}") for f in os.listdir(path))
+                has_type = bool(matching_paths)
                 if not has_type:
                     errors.append(f"⚠️ No .{filetype} files found in directory.")
 
@@ -299,21 +332,10 @@ class PDFCompiler(ttk.Frame):
         path = self.path_var.get().strip()
         filetype = self.filetype_var.get().lower()
 
-        SUPPORTED_ALL = [
-            "jpg", "jpeg", "png",
-            "webp", "heic", "heif"
-        ]
-
-        if filetype == "combine":
-            matching_files = natsorted([
-                f for f in os.listdir(path)
-                if any(f.lower().endswith(f".{ext}") for ext in SUPPORTED_ALL)
-            ])
-        else:
-            matching_files = natsorted([
-                f for f in os.listdir(path)
-                if f.lower().endswith(f".{filetype}")
-            ])
+        if not path or not os.path.isdir(path):
+            messagebox.showerror("Invalid Directory", "Please select a valid folder.")
+            return
+        matching_files = collect_image_paths(path, filetype)
 
         self.image_listbox.delete(0, tk.END)
 
@@ -321,8 +343,8 @@ class PDFCompiler(ttk.Frame):
             messagebox.showwarning("No Files Found", f"No files found matching selection.")
             return
 
-        for f in matching_files:
-            self.image_listbox.insert(tk.END, f)
+        for filename in matching_files:
+            self.image_listbox.insert(tk.END, os.path.relpath(filename, path))
 
         messagebox.showinfo("Scan Complete", f"✅ Found {len(matching_files)} file(s).")
 

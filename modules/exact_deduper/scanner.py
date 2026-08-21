@@ -1,5 +1,6 @@
 from collections import defaultdict
 from difflib import SequenceMatcher
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -9,6 +10,12 @@ from modules.exact_deduper.models import FileEntry
 from modules.exact_deduper.utils import hash_file
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v"}
+
+# Relative matching is intentionally a heuristic.  These limits keep a folder
+# with many generic names (for example, thousands of screenshots) from turning
+# a scan into a quadratic number of comparisons.
+MAX_RELATIVE_SIGNATURE_BUCKET = 200
+MAX_RELATIVE_NGRAMS = 12
 
 
 def _emit(callback, event, **data):
@@ -117,6 +124,113 @@ def _normalize_name_for_matching(path: Path) -> str:
     return " ".join(name.split())
 
 
+def _relative_name_signatures(normalized_name: str) -> set[str]:
+    """Return inexpensive, reasonably distinctive lookup keys for a name."""
+    compact = normalized_name.replace(" ", "")
+    signatures = set()
+
+    # Long words make good blocks for reordered or lightly edited filenames.
+    tokens = sorted(
+        {token for token in normalized_name.split() if len(token) >= 4},
+        key=lambda token: (-len(token), token),
+    )
+    signatures.update(f"token:{token}" for token in tokens[:4])
+
+    # Four-character slices also cover a single edited word such as
+    # "holidayvideo" -> "holidayvideos".  Sample long names so one unusually
+    # long filename cannot dominate the index.
+    if len(compact) >= 4:
+        starts = range(0, len(compact) - 3)
+        if len(compact) > MAX_RELATIVE_NGRAMS + 3:
+            step = (len(compact) - 4) / max(1, MAX_RELATIVE_NGRAMS - 1)
+            starts = {round(position * step) for position in range(MAX_RELATIVE_NGRAMS)}
+        signatures.update(f"gram:{compact[start:start + 4]}" for start in starts)
+
+    return signatures
+
+
+def _relative_size_bucket(size: int, size_gate: float) -> int:
+    """Group sizes where files in the same bucket pass the fast size gate."""
+    if size <= 0:
+        return 0
+    # With a 0.70 gate, one bucket spans less than 1 / 0.70 times in size.
+    bucket_base = 1.0 / max(size_gate, 0.01)
+    return int(math.log(size) / math.log(bucket_base))
+
+
+def _add_block_candidate_pairs(
+    indices: list[int],
+    files: list[FileEntry],
+    size_gate: float,
+    candidate_pairs: set[tuple[int, int]],
+):
+    """Add a linear number of useful comparison pairs from one name block.
+
+    A previous version compared every member of every extension with every
+    other member.  Here each size-compatible block is connected to an anchor,
+    plus neighbouring anchors.  This preserves the useful transitive grouping
+    behaviour while avoiding a combinatorial explosion for common names.
+    """
+    if len(indices) < 2:
+        return
+
+    by_size_bucket: dict[int, list[int]] = defaultdict(list)
+    for index in indices:
+        by_size_bucket[_relative_size_bucket(files[index].size, size_gate)].append(index)
+
+    ordered_buckets = sorted(by_size_bucket)
+    previous_anchor = None
+    for bucket in ordered_buckets:
+        members = by_size_bucket[bucket]
+        anchor = members[0]
+        for index in members[1:]:
+            candidate_pairs.add((min(anchor, index), max(anchor, index)))
+        if previous_anchor is not None:
+            candidate_pairs.add((min(previous_anchor, anchor), max(previous_anchor, anchor)))
+        previous_anchor = anchor
+
+
+def _build_relative_candidate_pairs(
+    files: list[FileEntry],
+    size_gate: float,
+    progress_callback=None,
+    cancel_check=None,
+) -> tuple[list[str], set[tuple[int, int]]] | None:
+    """Build a bounded set of plausible relative-match comparisons.
+
+    Files must share an extension.  Exact normalized names are always indexed;
+    fuzzy blocks use distinctive word and four-character signatures, while
+    exceptionally common signatures are ignored.  The final scorer remains
+    the authority on whether a pair is a relative match.
+    """
+    normalized_names = [_normalize_name_for_matching(entry.path) for entry in files]
+    exact_name_blocks: dict[tuple[str, str], list[int]] = defaultdict(list)
+    fuzzy_blocks: dict[tuple[str, str], list[int]] = defaultdict(list)
+
+    for index, entry in enumerate(files):
+        if _should_cancel(cancel_check):
+            return None
+        suffix = entry.path.suffix.lower()
+        name = normalized_names[index]
+        if name:
+            exact_name_blocks[(suffix, name)].append(index)
+            for signature in _relative_name_signatures(name):
+                fuzzy_blocks[(suffix, signature)].append(index)
+
+    candidate_pairs: set[tuple[int, int]] = set()
+    for indices in exact_name_blocks.values():
+        _add_block_candidate_pairs(indices, files, size_gate, candidate_pairs)
+
+    # Generic signatures such as "gram:tion" are not selective enough to be
+    # useful and were the source of most of the old scan's work.
+    for indices in fuzzy_blocks.values():
+        if len(indices) <= MAX_RELATIVE_SIGNATURE_BUCKET:
+            _add_block_candidate_pairs(indices, files, size_gate, candidate_pairs)
+
+    _emit(progress_callback, "candidate_plan", candidates=len(candidate_pairs), files=len(files))
+    return normalized_names, candidate_pairs
+
+
 def _probe_video_duration_seconds(path: Path) -> float | None:
     if path.suffix.lower() not in VIDEO_EXTENSIONS:
         return None
@@ -152,10 +266,11 @@ def _probe_video_duration_seconds(path: Path) -> float | None:
     return duration if duration > 0 else None
 
 
-def _compute_relative_score(a: FileEntry, b: FileEntry) -> float:
-    name_a = _normalize_name_for_matching(a.path)
-    name_b = _normalize_name_for_matching(b.path)
-    name_score = SequenceMatcher(None, name_a, name_b).ratio()
+def _compute_relative_score(a: FileEntry, b: FileEntry, name_score: float | None = None) -> float:
+    if name_score is None:
+        name_a = _normalize_name_for_matching(a.path)
+        name_b = _normalize_name_for_matching(b.path)
+        name_score = SequenceMatcher(None, name_a, name_b).ratio()
 
     large = max(a.size, b.size, 1)
     size_score = min(a.size, b.size) / large
@@ -305,15 +420,6 @@ def scan_for_relative_duplicates(
         return []
     files, file_count = discovered
 
-    _emit(progress_callback, "metadata_start", total=file_count)
-    for idx, entry in enumerate(files, start=1):
-        if _should_cancel(cancel_check):
-            _emit(progress_callback, "scan_cancelled")
-            return []
-        entry.duration_seconds = _probe_video_duration_seconds(entry.path)
-        if idx % 25 == 0 or idx == file_count:
-            _emit(progress_callback, "metadata_progress", current=idx, total=file_count)
-
     n = len(files)
     if n < 2:
         _emit(progress_callback, "scan_complete", groups=0, files_scanned=file_count, mode="relative")
@@ -323,7 +429,36 @@ def scan_for_relative_duplicates(
     near_name_gate = min(0.65, max(0.35, min_threshold - 0.2))
     near_size_gate = min(0.9, max(0.5, min_threshold - 0.15))
 
-    total_pairs = (n * (n - 1)) // 2
+    candidate_data = _build_relative_candidate_pairs(
+        files,
+        near_size_gate,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+    )
+    if candidate_data is None:
+        _emit(progress_callback, "scan_cancelled")
+        return []
+    normalized_names, candidate_pairs = candidate_data
+
+    # ffprobe is an external process and was previously run for every video in
+    # the folder.  Only candidates can influence a relative-match result, so
+    # defer probes until after the cheap name/size blocking step.
+    candidate_video_indices = sorted({
+        index
+        for pair in candidate_pairs
+        for index in pair
+        if files[index].path.suffix.lower() in VIDEO_EXTENSIONS
+    })
+    _emit(progress_callback, "metadata_start", total=len(candidate_video_indices))
+    for position, index in enumerate(candidate_video_indices, start=1):
+        if _should_cancel(cancel_check):
+            _emit(progress_callback, "scan_cancelled")
+            return []
+        files[index].duration_seconds = _probe_video_duration_seconds(files[index].path)
+        if position % 25 == 0 or position == len(candidate_video_indices):
+            _emit(progress_callback, "metadata_progress", current=position, total=len(candidate_video_indices))
+
+    total_pairs = len(candidate_pairs)
     _emit(progress_callback, "compare_start", total=total_pairs)
 
     uf = _UnionFind(n)
@@ -331,39 +466,31 @@ def scan_for_relative_duplicates(
 
     pair_idx = 0
     progress_step = max(1, total_pairs // 300)
-    for i in range(n - 1):
+    for i, j in sorted(candidate_pairs):
+        if _should_cancel(cancel_check):
+            _emit(progress_callback, "scan_cancelled")
+            return []
+
         file_a = files[i]
-        name_a = _normalize_name_for_matching(file_a.path)
+        file_b = files[j]
+        pair_idx += 1
 
-        for j in range(i + 1, n):
-            if _should_cancel(cancel_check):
-                _emit(progress_callback, "scan_cancelled")
-                return []
+        if pair_idx % progress_step == 0 or pair_idx == total_pairs:
+            _emit(progress_callback, "compare_progress", current=pair_idx, total=total_pairs)
 
-            file_b = files[j]
-            pair_idx += 1
+        fast_name = SequenceMatcher(None, normalized_names[i], normalized_names[j]).ratio()
+        if fast_name < near_name_gate:
+            continue
 
-            if pair_idx % progress_step == 0 or pair_idx == total_pairs:
-                _emit(progress_callback, "compare_progress", current=pair_idx, total=total_pairs)
+        large_size = max(file_a.size, file_b.size, 1)
+        fast_size = min(file_a.size, file_b.size) / large_size
+        if fast_size < near_size_gate:
+            continue
 
-            # First pass gate to keep first implementation reasonably fast.
-            if file_a.path.suffix.lower() != file_b.path.suffix.lower():
-                continue
-
-            name_b = _normalize_name_for_matching(file_b.path)
-            fast_name = SequenceMatcher(None, name_a, name_b).ratio()
-            if fast_name < near_name_gate:
-                continue
-
-            large_size = max(file_a.size, file_b.size, 1)
-            fast_size = min(file_a.size, file_b.size) / large_size
-            if fast_size < near_size_gate:
-                continue
-
-            score = _compute_relative_score(file_a, file_b)
-            if score >= min_threshold:
-                uf.union(i, j)
-                accepted_pairs[(i, j)] = score
+        score = _compute_relative_score(file_a, file_b, name_score=fast_name)
+        if score >= min_threshold:
+            uf.union(i, j)
+            accepted_pairs[(i, j)] = score
 
     groups_by_root: dict[int, list[int]] = defaultdict(list)
     for idx in range(n):

@@ -948,6 +948,14 @@ class ExactDeduperFrame(ttk.Frame):
         elif event == "metadata_progress":
             self.progress["value"] = int(data.get("current", 0))
 
+        elif event == "candidate_plan":
+            self.log(
+                "Relative scan narrowed {files} files to {candidates} plausible comparison(s).".format(
+                    files=int(data.get("files", 0)),
+                    candidates=int(data.get("candidates", 0)),
+                )
+            )
+
         elif event == "compare_start":
             self.progress["maximum"] = max(1, int(data.get("total", 1)))
             self.progress["value"] = 0
